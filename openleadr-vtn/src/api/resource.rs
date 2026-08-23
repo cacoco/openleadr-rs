@@ -22,14 +22,14 @@ use crate::{
     },
     data_source::{EventCrud, ResourceCrud, VenCrud, VenObjectPrivacy},
     error::AppError,
-    jwt::{Scope, User},
+    jwt::{Claims, Scope, User},
 };
 
-pub async fn get_all(
-    State(resource_source): State<Arc<dyn ResourceCrud>>,
-    ValidatedQuery(query_params): ValidatedQuery<QueryParams>,
-    User(user): User,
-) -> AppResponse<Vec<Resource>> {
+pub(crate) async fn get_all_core(
+    resource_source: &dyn ResourceCrud,
+    query_params: QueryParams,
+    user: Claims,
+) -> Result<Vec<Resource>, AppError> {
     trace!(?query_params);
 
     let resources = if user.has_scope(Scope::ReadAll) {
@@ -50,14 +50,24 @@ pub async fn get_all(
         resources.len()
     );
 
-    Ok(Json(resources))
+    Ok(resources)
 }
 
-pub async fn get(
+pub async fn get_all(
     State(resource_source): State<Arc<dyn ResourceCrud>>,
-    Path(id): Path<ResourceId>,
+    ValidatedQuery(query_params): ValidatedQuery<QueryParams>,
     User(user): User,
-) -> AppResponse<Resource> {
+) -> AppResponse<Vec<Resource>> {
+    Ok(Json(
+        get_all_core(&*resource_source, query_params, user).await?,
+    ))
+}
+
+pub(crate) async fn get_core(
+    resource_source: &dyn ResourceCrud,
+    id: ResourceId,
+    user: Claims,
+) -> Result<Resource, AppError> {
     let resource = if user.has_scope(Scope::ReadAll) {
         resource_source.retrieve(&id, &None).await?
     } else if user.has_scope(Scope::ReadVenObjects) {
@@ -77,23 +87,31 @@ pub async fn get(
         "resource retrieved"
     );
 
-    Ok(Json(resource))
+    Ok(resource)
+}
+
+pub async fn get(
+    State(resource_source): State<Arc<dyn ResourceCrud>>,
+    Path(id): Path<ResourceId>,
+    User(user): User,
+) -> AppResponse<Resource> {
+    Ok(Json(get_core(&*resource_source, id, user).await?))
 }
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "Handler which uses many aspects of the state"
+    reason = "Core fn needs access to a lot of the state"
 )]
-pub async fn add(
-    State(ven_source): State<Arc<dyn VenCrud>>,
-    State(event_source): State<Arc<dyn EventCrud>>,
-    State(privacy): State<Arc<dyn VenObjectPrivacy>>,
-    State(resource_source): State<Arc<dyn ResourceCrud>>,
-    State(notifier_state): State<Arc<NotifierState>>,
-    State(object_privacy): State<Arc<dyn VenObjectPrivacy>>,
-    User(user): User,
-    ValidatedJson(new_resource): ValidatedJson<ResourceRequest>,
-) -> Result<(StatusCode, Json<Resource>), AppError> {
+pub(crate) async fn add_core(
+    ven_source: &dyn VenCrud,
+    event_source: &dyn EventCrud,
+    privacy: &dyn VenObjectPrivacy,
+    resource_source: &dyn ResourceCrud,
+    notifier_state: &NotifierState,
+    object_privacy: &dyn VenObjectPrivacy,
+    user: Claims,
+    new_resource: ResourceRequest,
+) -> Result<Resource, AppError> {
     let resource = if user.has_scope(Scope::WriteVensBl) {
         let ResourceRequest::BlResourceRequest(new_resource) = new_resource else {
             return Err(AppError::BadRequest(
@@ -139,33 +157,62 @@ pub async fn add(
     );
 
     subscription::notify(
-        &*ven_source,
-        &*event_source,
-        &*privacy,
-        &notifier_state,
+        ven_source,
+        event_source,
+        privacy,
+        notifier_state,
         Operation::Create,
         AnyObject::Resource(resource.clone()),
     )
     .await;
 
-    Ok((StatusCode::CREATED, Json(resource)))
+    Ok(resource)
 }
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "This is a handler which needs a lot of the state."
+    reason = "Handler which uses many aspects of the state"
 )]
-pub async fn edit(
+pub async fn add(
     State(ven_source): State<Arc<dyn VenCrud>>,
     State(event_source): State<Arc<dyn EventCrud>>,
     State(privacy): State<Arc<dyn VenObjectPrivacy>>,
     State(resource_source): State<Arc<dyn ResourceCrud>>,
     State(notifier_state): State<Arc<NotifierState>>,
     State(object_privacy): State<Arc<dyn VenObjectPrivacy>>,
-    Path(id): Path<ResourceId>,
     User(user): User,
-    ValidatedJson(update): ValidatedJson<ResourceRequest>,
-) -> AppResponse<Resource> {
+    ValidatedJson(new_resource): ValidatedJson<ResourceRequest>,
+) -> Result<(StatusCode, Json<Resource>), AppError> {
+    let resource = add_core(
+        &*ven_source,
+        &*event_source,
+        &*privacy,
+        &*resource_source,
+        &notifier_state,
+        &*object_privacy,
+        user,
+        new_resource,
+    )
+    .await?;
+
+    Ok((StatusCode::CREATED, Json(resource)))
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Core fn needs access to a lot of the state"
+)]
+pub(crate) async fn edit_core(
+    ven_source: &dyn VenCrud,
+    event_source: &dyn EventCrud,
+    privacy: &dyn VenObjectPrivacy,
+    resource_source: &dyn ResourceCrud,
+    notifier_state: &NotifierState,
+    object_privacy: &dyn VenObjectPrivacy,
+    id: ResourceId,
+    user: Claims,
+    update: ResourceRequest,
+) -> Result<Resource, AppError> {
     let resource = if user.has_scope(Scope::WriteVensBl) {
         let ResourceRequest::BlResourceRequest(update) = update else {
             return Err(AppError::BadRequest(
@@ -216,27 +263,58 @@ pub async fn edit(
     );
 
     subscription::notify(
-        &*ven_source,
-        &*event_source,
-        &*privacy,
-        &notifier_state,
+        ven_source,
+        event_source,
+        privacy,
+        notifier_state,
         Operation::Update,
         AnyObject::Resource(resource.clone()),
     )
     .await;
 
-    Ok(Json(resource))
+    Ok(resource)
 }
 
-pub async fn delete(
+#[expect(
+    clippy::too_many_arguments,
+    reason = "This is a handler which needs a lot of the state."
+)]
+pub async fn edit(
     State(ven_source): State<Arc<dyn VenCrud>>,
     State(event_source): State<Arc<dyn EventCrud>>,
     State(privacy): State<Arc<dyn VenObjectPrivacy>>,
     State(resource_source): State<Arc<dyn ResourceCrud>>,
     State(notifier_state): State<Arc<NotifierState>>,
+    State(object_privacy): State<Arc<dyn VenObjectPrivacy>>,
     Path(id): Path<ResourceId>,
     User(user): User,
+    ValidatedJson(update): ValidatedJson<ResourceRequest>,
 ) -> AppResponse<Resource> {
+    Ok(Json(
+        edit_core(
+            &*ven_source,
+            &*event_source,
+            &*privacy,
+            &*resource_source,
+            &notifier_state,
+            &*object_privacy,
+            id,
+            user,
+            update,
+        )
+        .await?,
+    ))
+}
+
+pub(crate) async fn delete_core(
+    ven_source: &dyn VenCrud,
+    event_source: &dyn EventCrud,
+    privacy: &dyn VenObjectPrivacy,
+    resource_source: &dyn ResourceCrud,
+    notifier_state: &NotifierState,
+    id: ResourceId,
+    user: Claims,
+) -> Result<Resource, AppError> {
     let resource = if user.has_scope(Scope::WriteVensBl) {
         resource_source.delete(&id, &None).await?
     } else if user.has_scope(Scope::WriteVensVen) {
@@ -252,16 +330,39 @@ pub async fn delete(
     info!(%id, client_id = user.sub, "deleted resource");
 
     subscription::notify(
-        &*ven_source,
-        &*event_source,
-        &*privacy,
-        &notifier_state,
+        ven_source,
+        event_source,
+        privacy,
+        notifier_state,
         Operation::Delete,
         AnyObject::Resource(resource.clone()),
     )
     .await;
 
-    Ok(Json(resource))
+    Ok(resource)
+}
+
+pub async fn delete(
+    State(ven_source): State<Arc<dyn VenCrud>>,
+    State(event_source): State<Arc<dyn EventCrud>>,
+    State(privacy): State<Arc<dyn VenObjectPrivacy>>,
+    State(resource_source): State<Arc<dyn ResourceCrud>>,
+    State(notifier_state): State<Arc<NotifierState>>,
+    Path(id): Path<ResourceId>,
+    User(user): User,
+) -> AppResponse<Resource> {
+    Ok(Json(
+        delete_core(
+            &*ven_source,
+            &*event_source,
+            &*privacy,
+            &*resource_source,
+            &notifier_state,
+            id,
+            user,
+        )
+        .await?,
+    ))
 }
 
 #[derive(Deserialize, Validate, Debug)]
