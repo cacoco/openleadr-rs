@@ -132,8 +132,9 @@ fn problem(reference: Uuid, status: StatusCode, detail: Option<String>) -> Probl
     }
 }
 
-impl IntoResponse for AppError {
-    fn into_response(self) -> Response {
+impl AppError {
+    /// Maps this error to an HTTP status and RFC7807 problem body.
+    pub(crate) fn into_problem(self) -> (StatusCode, Problem) {
         let reference = Uuid::new_v4();
 
         let problem = match self {
@@ -249,7 +250,15 @@ impl IntoResponse for AppError {
             }
         };
 
-        let mut response = (problem.status, Json(problem)).into_response();
+        (problem.status, problem)
+    }
+}
+
+impl IntoResponse for AppError {
+    fn into_response(self) -> Response {
+        let (status, problem) = self.into_problem();
+
+        let mut response = (status, Json(problem)).into_response();
         if response.status() == StatusCode::UNAUTHORIZED {
             response.headers_mut().insert(
                 header::WWW_AUTHENTICATE,
