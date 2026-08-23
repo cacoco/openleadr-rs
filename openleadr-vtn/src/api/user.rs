@@ -2,7 +2,7 @@ use crate::{
     api::{AppResponse, ValidatedJson},
     data_source::{AuthSource, UserDetails},
     error::AppError,
-    jwt::{Scope, User},
+    jwt::{Claims, Scope, User},
 };
 use axum::{
     Json,
@@ -31,10 +31,10 @@ pub struct NewCredential {
     client_secret: String,
 }
 
-pub async fn get_all(
-    State(auth_source): State<Arc<dyn AuthSource>>,
-    User(user): User,
-) -> AppResponse<Vec<UserDetails>> {
+pub(crate) async fn get_all_core(
+    auth_source: &dyn AuthSource,
+    user: Claims,
+) -> Result<Vec<UserDetails>, AppError> {
     if !user.has_scope(Scope::WriteUsers) {
         return Err(AppError::Forbidden("Missing 'write_users' scope"));
     }
@@ -42,7 +42,28 @@ pub async fn get_all(
     let users = auth_source.get_all_users().await?;
 
     trace!(client_id = user.sub, "received {} users", users.len());
-    Ok(Json(users))
+    Ok(users)
+}
+
+pub async fn get_all(
+    State(auth_source): State<Arc<dyn AuthSource>>,
+    User(user): User,
+) -> AppResponse<Vec<UserDetails>> {
+    Ok(Json(get_all_core(&*auth_source, user).await?))
+}
+
+pub(crate) async fn get_core(
+    auth_source: &dyn AuthSource,
+    id: String,
+    user: Claims,
+) -> Result<UserDetails, AppError> {
+    if !user.has_scope(Scope::WriteUsers) {
+        return Err(AppError::Forbidden("Missing 'write_users' scope"));
+    }
+
+    let u = auth_source.get_user(&id).await?;
+    trace!(user_id = u.id(), client_id = user.sub, "received user");
+    Ok(u)
 }
 
 pub async fn get(
@@ -50,20 +71,14 @@ pub async fn get(
     Path(id): Path<String>,
     User(user): User,
 ) -> AppResponse<UserDetails> {
-    if !user.has_scope(Scope::WriteUsers) {
-        return Err(AppError::Forbidden("Missing 'write_users' scope"));
-    }
-
-    let u = auth_source.get_user(&id).await?;
-    trace!(user_id = u.id(), client_id = user.sub, "received user");
-    Ok(Json(u))
+    Ok(Json(get_core(&*auth_source, id, user).await?))
 }
 
-pub async fn add_user(
-    State(auth_source): State<Arc<dyn AuthSource>>,
-    User(user): User,
-    ValidatedJson(new_user): ValidatedJson<NewUser>,
-) -> Result<(StatusCode, Json<UserDetails>), AppError> {
+pub(crate) async fn add_user_core(
+    auth_source: &dyn AuthSource,
+    user: Claims,
+    new_user: NewUser,
+) -> Result<UserDetails, AppError> {
     if !user.has_scope(Scope::WriteUsers) {
         return Err(AppError::Forbidden("Missing 'write_users' scope"));
     }
@@ -76,15 +91,24 @@ pub async fn add_user(
         )
         .await?;
     info!(user_id = u.id(), client_id = user.sub, "created new user");
+    Ok(u)
+}
+
+pub async fn add_user(
+    State(auth_source): State<Arc<dyn AuthSource>>,
+    User(user): User,
+    ValidatedJson(new_user): ValidatedJson<NewUser>,
+) -> Result<(StatusCode, Json<UserDetails>), AppError> {
+    let u = add_user_core(&*auth_source, user, new_user).await?;
     Ok((StatusCode::CREATED, Json(u)))
 }
 
-pub async fn add_credential(
-    State(auth_source): State<Arc<dyn AuthSource>>,
-    Path(id): Path<String>,
-    User(user): User,
-    ValidatedJson(new): ValidatedJson<NewCredential>,
-) -> AppResponse<UserDetails> {
+pub(crate) async fn add_credential_core(
+    auth_source: &dyn AuthSource,
+    id: String,
+    user: Claims,
+    new: NewCredential,
+) -> Result<UserDetails, AppError> {
     if !user.has_scope(Scope::WriteUsers) {
         return Err(AppError::Forbidden("Missing 'write_users' scope"));
     }
@@ -98,15 +122,26 @@ pub async fn add_credential(
         client_id = user.sub,
         "created new credential for user"
     );
-    Ok(Json(u))
+    Ok(u)
 }
 
-pub async fn edit(
+pub async fn add_credential(
     State(auth_source): State<Arc<dyn AuthSource>>,
     Path(id): Path<String>,
     User(user): User,
-    ValidatedJson(modified): ValidatedJson<NewUser>,
+    ValidatedJson(new): ValidatedJson<NewCredential>,
 ) -> AppResponse<UserDetails> {
+    Ok(Json(
+        add_credential_core(&*auth_source, id, user, new).await?,
+    ))
+}
+
+pub(crate) async fn edit_core(
+    auth_source: &dyn AuthSource,
+    id: String,
+    user: Claims,
+    modified: NewUser,
+) -> Result<UserDetails, AppError> {
     if !user.has_scope(Scope::WriteUsers) {
         return Err(AppError::Forbidden("Missing 'write_users' scope"));
     }
@@ -121,7 +156,30 @@ pub async fn edit(
         .await?;
 
     info!(user_id = u.id(), client_id = user.sub, "updated user");
-    Ok(Json(u))
+    Ok(u)
+}
+
+pub async fn edit(
+    State(auth_source): State<Arc<dyn AuthSource>>,
+    Path(id): Path<String>,
+    User(user): User,
+    ValidatedJson(modified): ValidatedJson<NewUser>,
+) -> AppResponse<UserDetails> {
+    Ok(Json(edit_core(&*auth_source, id, user, modified).await?))
+}
+
+pub(crate) async fn delete_user_core(
+    auth_source: &dyn AuthSource,
+    id: String,
+    user: Claims,
+) -> Result<UserDetails, AppError> {
+    if !user.has_scope(Scope::WriteUsers) {
+        return Err(AppError::Forbidden("Missing 'write_users' scope"));
+    }
+
+    let u = auth_source.remove_user(&id).await?;
+    info!(user_id = u.id(), client_id = user.sub, "deleted user");
+    Ok(u)
 }
 
 pub async fn delete_user(
@@ -129,20 +187,15 @@ pub async fn delete_user(
     Path(id): Path<String>,
     User(user): User,
 ) -> AppResponse<UserDetails> {
-    if !user.has_scope(Scope::WriteUsers) {
-        return Err(AppError::Forbidden("Missing 'write_users' scope"));
-    }
-
-    let u = auth_source.remove_user(&id).await?;
-    info!(user_id = u.id(), client_id = user.sub, "deleted user");
-    Ok(Json(u))
+    Ok(Json(delete_user_core(&*auth_source, id, user).await?))
 }
 
-pub async fn delete_credential(
-    State(auth_source): State<Arc<dyn AuthSource>>,
-    Path((user_id, client_id)): Path<(String, String)>,
-    User(user): User,
-) -> AppResponse<UserDetails> {
+pub(crate) async fn delete_credential_core(
+    auth_source: &dyn AuthSource,
+    user_id: String,
+    client_id: String,
+    user: Claims,
+) -> Result<UserDetails, AppError> {
     if !user.has_scope(Scope::WriteUsers) {
         return Err(AppError::Forbidden("Missing 'write_users' scope"));
     }
@@ -154,7 +207,17 @@ pub async fn delete_credential(
         client_id = user.sub,
         "deleted credential"
     );
-    Ok(Json(u))
+    Ok(u)
+}
+
+pub async fn delete_credential(
+    State(auth_source): State<Arc<dyn AuthSource>>,
+    Path((user_id, client_id)): Path<(String, String)>,
+    User(user): User,
+) -> AppResponse<UserDetails> {
+    Ok(Json(
+        delete_credential_core(&*auth_source, user_id, client_id, user).await?,
+    ))
 }
 
 #[cfg(test)]
