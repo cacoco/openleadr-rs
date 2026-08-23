@@ -3,7 +3,10 @@ use crate::{api::ValidatedForm, data_source::AuthSource, jwt::JwtManager};
 #[cfg(feature = "internal-oauth")]
 use axum::extract::State;
 #[cfg(feature = "internal-oauth")]
-use axum_extra::headers::{Authorization, authorization::Basic};
+use headers::{
+    Authorization, Header,
+    authorization::{Basic, Bearer},
+};
 #[cfg(feature = "internal-oauth")]
 use serde::Deserialize;
 #[cfg(feature = "internal-oauth")]
@@ -17,8 +20,6 @@ use axum::{
     http::{Response, StatusCode},
     response::IntoResponse,
 };
-#[cfg(feature = "internal-oauth")]
-use axum_extra::headers::Header;
 use openleadr_wire::oauth::{OAuthError, OAuthErrorType};
 use reqwest::header;
 
@@ -88,13 +89,16 @@ impl IntoResponse for AccessTokenResponse {
     }
 }
 
-/// RFC 6749 client credentials grant flow
+/// RFC 6749 client credentials grant flow. Operates on a plain
+/// `http::HeaderMap` (not an axum extractor) and the standalone `headers`
+/// crate (not `axum_extra`'s re-export of it) for typed header parsing, so
+/// it can be shared by any HTTP layer that wraps this crate.
 #[cfg(feature = "internal-oauth")]
-pub(crate) async fn token(
-    State(auth_source): State<Arc<dyn AuthSource>>,
-    State(jwt_manager): State<Arc<JwtManager>>,
-    headers: axum::http::HeaderMap,
-    ValidatedForm(request): ValidatedForm<AccessTokenRequest>,
+pub(crate) async fn token_core(
+    auth_source: &dyn AuthSource,
+    jwt_manager: &JwtManager,
+    headers: &http::HeaderMap,
+    request: AccessTokenRequest,
 ) -> Result<AccessTokenResponse, ResponseOAuthError> {
     if request.grant_type != "client_credentials" {
         return Err(OAuthError::new(OAuthErrorType::UnsupportedGrantType)
@@ -103,17 +107,13 @@ pub(crate) async fn token(
     }
 
     let mut auth_header = None;
-    if let Some(header) = headers.get(axum::http::header::AUTHORIZATION) {
+    if let Some(header) = headers.get(http::header::AUTHORIZATION) {
         if let Ok(basic_auth) = Authorization::<Basic>::decode(&mut [header].into_iter()) {
             auth_header = Some((
                 basic_auth.username().to_string(),
                 basic_auth.password().to_string(),
             ))
-        } else if Authorization::<axum_extra::headers::authorization::Bearer>::decode(
-            &mut [header].into_iter(),
-        )
-        .is_ok()
-        {
+        } else if Authorization::<Bearer>::decode(&mut [header].into_iter()).is_ok() {
             trace!("login request contained Bearer token which got ignored")
         }
     }
@@ -165,4 +165,14 @@ pub(crate) async fn token(
         expires_in: expiration.as_secs(),
         scope: None,
     })
+}
+
+#[cfg(feature = "internal-oauth")]
+pub(crate) async fn token(
+    State(auth_source): State<Arc<dyn AuthSource>>,
+    State(jwt_manager): State<Arc<JwtManager>>,
+    headers: axum::http::HeaderMap,
+    ValidatedForm(request): ValidatedForm<AccessTokenRequest>,
+) -> Result<AccessTokenResponse, ResponseOAuthError> {
+    token_core(&*auth_source, &jwt_manager, &headers, request).await
 }
