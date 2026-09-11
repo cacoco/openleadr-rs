@@ -16,7 +16,7 @@ use crate::{
     },
     data_source::{EventCrud, ProgramCrud, VenCrud, VenObjectPrivacy},
     error::AppError,
-    jwt::{Scope, User},
+    jwt::{Claims, Scope, User},
 };
 use openleadr_wire::{
     Program,
@@ -24,11 +24,11 @@ use openleadr_wire::{
     subscription::{AnyObject, Operation},
 };
 
-pub async fn get_all(
-    State(program_source): State<Arc<dyn ProgramCrud>>,
-    ValidatedQuery(query_params): ValidatedQuery<QueryParams>,
-    User(user): User,
-) -> AppResponse<Vec<Program>> {
+pub(crate) async fn get_all_core(
+    program_source: &dyn ProgramCrud,
+    query_params: QueryParams,
+    user: Claims,
+) -> Result<Vec<Program>, AppError> {
     trace!(?query_params);
 
     let programs = if user.has_scope(Scope::ReadAll) {
@@ -49,14 +49,24 @@ pub async fn get_all(
         programs.len()
     );
 
-    Ok(Json(programs))
+    Ok(programs)
 }
 
-pub async fn get(
+pub async fn get_all(
     State(program_source): State<Arc<dyn ProgramCrud>>,
-    Path(id): Path<ProgramId>,
+    ValidatedQuery(query_params): ValidatedQuery<QueryParams>,
     User(user): User,
-) -> AppResponse<Program> {
+) -> AppResponse<Vec<Program>> {
+    Ok(Json(
+        get_all_core(&*program_source, query_params, user).await?,
+    ))
+}
+
+pub(crate) async fn get_core(
+    program_source: &dyn ProgramCrud,
+    id: ProgramId,
+    user: Claims,
+) -> Result<Program, AppError> {
     let program = if user.has_scope(Scope::ReadAll) {
         program_source.retrieve(&id, &None).await?
     } else if user.has_scope(Scope::ReadTargets) {
@@ -76,18 +86,26 @@ pub async fn get(
         "program retrieved"
     );
 
-    Ok(Json(program))
+    Ok(program)
 }
 
-pub async fn add(
-    State(ven_source): State<Arc<dyn VenCrud>>,
-    State(event_source): State<Arc<dyn EventCrud>>,
-    State(privacy): State<Arc<dyn VenObjectPrivacy>>,
+pub async fn get(
     State(program_source): State<Arc<dyn ProgramCrud>>,
-    State(notifier_state): State<Arc<NotifierState>>,
+    Path(id): Path<ProgramId>,
     User(user): User,
-    ValidatedJson(new_program): ValidatedJson<ProgramRequest>,
-) -> Result<(StatusCode, Json<Program>), AppError> {
+) -> AppResponse<Program> {
+    Ok(Json(get_core(&*program_source, id, user).await?))
+}
+
+pub(crate) async fn add_core(
+    ven_source: &dyn VenCrud,
+    event_source: &dyn EventCrud,
+    privacy: &dyn VenObjectPrivacy,
+    program_source: &dyn ProgramCrud,
+    notifier_state: &NotifierState,
+    user: Claims,
+    new_program: ProgramRequest,
+) -> Result<Program, AppError> {
     if !user.has_scope(Scope::WritePrograms) {
         return Err(AppError::Forbidden("Missing 'write_programs' scope"));
     }
@@ -104,32 +122,55 @@ pub async fn add(
     );
 
     subscription::notify(
-        &*ven_source,
-        &*event_source,
-        &*privacy,
-        &notifier_state,
+        ven_source,
+        event_source,
+        privacy,
+        notifier_state,
         Operation::Create,
         AnyObject::Program(program.clone()),
     )
     .await;
+
+    Ok(program)
+}
+
+pub async fn add(
+    State(ven_source): State<Arc<dyn VenCrud>>,
+    State(event_source): State<Arc<dyn EventCrud>>,
+    State(privacy): State<Arc<dyn VenObjectPrivacy>>,
+    State(program_source): State<Arc<dyn ProgramCrud>>,
+    State(notifier_state): State<Arc<NotifierState>>,
+    User(user): User,
+    ValidatedJson(new_program): ValidatedJson<ProgramRequest>,
+) -> Result<(StatusCode, Json<Program>), AppError> {
+    let program = add_core(
+        &*ven_source,
+        &*event_source,
+        &*privacy,
+        &*program_source,
+        &notifier_state,
+        user,
+        new_program,
+    )
+    .await?;
 
     Ok((StatusCode::CREATED, Json(program)))
 }
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "Handler which uses many aspects of the state"
+    reason = "Core fn needs access to a lot of the state"
 )]
-pub async fn edit(
-    State(ven_source): State<Arc<dyn VenCrud>>,
-    State(event_source): State<Arc<dyn EventCrud>>,
-    State(privacy): State<Arc<dyn VenObjectPrivacy>>,
-    State(program_source): State<Arc<dyn ProgramCrud>>,
-    State(notifier_state): State<Arc<NotifierState>>,
-    Path(id): Path<ProgramId>,
-    User(user): User,
-    ValidatedJson(content): ValidatedJson<ProgramRequest>,
-) -> AppResponse<Program> {
+pub(crate) async fn edit_core(
+    ven_source: &dyn VenCrud,
+    event_source: &dyn EventCrud,
+    privacy: &dyn VenObjectPrivacy,
+    program_source: &dyn ProgramCrud,
+    notifier_state: &NotifierState,
+    id: ProgramId,
+    user: Claims,
+    content: ProgramRequest,
+) -> Result<Program, AppError> {
     if !user.has_scope(Scope::WritePrograms) {
         return Err(AppError::Forbidden("Missing 'write_programs' scope"));
     }
@@ -146,16 +187,74 @@ pub async fn edit(
     );
 
     subscription::notify(
-        &*ven_source,
-        &*event_source,
-        &*privacy,
-        &notifier_state,
+        ven_source,
+        event_source,
+        privacy,
+        notifier_state,
         Operation::Update,
         AnyObject::Program(program.clone()),
     )
     .await;
 
-    Ok(Json(program))
+    Ok(program)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Handler which uses many aspects of the state"
+)]
+pub async fn edit(
+    State(ven_source): State<Arc<dyn VenCrud>>,
+    State(event_source): State<Arc<dyn EventCrud>>,
+    State(privacy): State<Arc<dyn VenObjectPrivacy>>,
+    State(program_source): State<Arc<dyn ProgramCrud>>,
+    State(notifier_state): State<Arc<NotifierState>>,
+    Path(id): Path<ProgramId>,
+    User(user): User,
+    ValidatedJson(content): ValidatedJson<ProgramRequest>,
+) -> AppResponse<Program> {
+    Ok(Json(
+        edit_core(
+            &*ven_source,
+            &*event_source,
+            &*privacy,
+            &*program_source,
+            &notifier_state,
+            id,
+            user,
+            content,
+        )
+        .await?,
+    ))
+}
+
+pub(crate) async fn delete_core(
+    ven_source: &dyn VenCrud,
+    event_source: &dyn EventCrud,
+    privacy: &dyn VenObjectPrivacy,
+    program_source: &dyn ProgramCrud,
+    notifier_state: &NotifierState,
+    id: ProgramId,
+    user: Claims,
+) -> Result<Program, AppError> {
+    if !user.has_scope(Scope::WritePrograms) {
+        return Err(AppError::Forbidden("Missing 'write_programs' scope"));
+    }
+
+    let program = program_source.delete(&id, &Some(user.client_id()?)).await?;
+    info!(%id, client_id = user.sub, "deleted program");
+
+    subscription::notify(
+        ven_source,
+        event_source,
+        privacy,
+        notifier_state,
+        Operation::Delete,
+        AnyObject::Program(program.clone()),
+    )
+    .await;
+
+    Ok(program)
 }
 
 pub async fn delete(
@@ -167,24 +266,18 @@ pub async fn delete(
     Path(id): Path<ProgramId>,
     User(user): User,
 ) -> AppResponse<Program> {
-    if !user.has_scope(Scope::WritePrograms) {
-        return Err(AppError::Forbidden("Missing 'write_programs' scope"));
-    }
-
-    let program = program_source.delete(&id, &Some(user.client_id()?)).await?;
-    info!(%id, client_id = user.sub, "deleted program");
-
-    subscription::notify(
-        &*ven_source,
-        &*event_source,
-        &*privacy,
-        &notifier_state,
-        Operation::Delete,
-        AnyObject::Program(program.clone()),
-    )
-    .await;
-
-    Ok(Json(program))
+    Ok(Json(
+        delete_core(
+            &*ven_source,
+            &*event_source,
+            &*privacy,
+            &*program_source,
+            &notifier_state,
+            id,
+            user,
+        )
+        .await?,
+    ))
 }
 
 #[derive(Deserialize, Validate, Debug)]
