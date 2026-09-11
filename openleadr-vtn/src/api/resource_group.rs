@@ -21,14 +21,14 @@ use crate::{
     },
     data_source::{EventCrud, ResourceGroupCrud, VenCrud, VenObjectPrivacy},
     error::AppError,
-    jwt::{Scope, User},
+    jwt::{Claims, Scope, User},
 };
 
-pub async fn get_all(
-    State(resource_group_source): State<Arc<dyn ResourceGroupCrud>>,
-    ValidatedQuery(query_params): ValidatedQuery<QueryParams>,
-    User(user): User,
-) -> AppResponse<Vec<ResourceGroup>> {
+pub(crate) async fn get_all_core(
+    resource_group_source: &dyn ResourceGroupCrud,
+    query_params: QueryParams,
+    user: Claims,
+) -> Result<Vec<ResourceGroup>, AppError> {
     trace!(?query_params);
 
     let resource_groups = if user.has_scope(Scope::ReadAll) {
@@ -51,14 +51,24 @@ pub async fn get_all(
         resource_groups.len()
     );
 
-    Ok(Json(resource_groups))
+    Ok(resource_groups)
 }
 
-pub async fn get(
+pub async fn get_all(
     State(resource_group_source): State<Arc<dyn ResourceGroupCrud>>,
-    Path(id): Path<ResourceGroupId>,
+    ValidatedQuery(query_params): ValidatedQuery<QueryParams>,
     User(user): User,
-) -> AppResponse<ResourceGroup> {
+) -> AppResponse<Vec<ResourceGroup>> {
+    Ok(Json(
+        get_all_core(&*resource_group_source, query_params, user).await?,
+    ))
+}
+
+pub(crate) async fn get_core(
+    resource_group_source: &dyn ResourceGroupCrud,
+    id: ResourceGroupId,
+    user: Claims,
+) -> Result<ResourceGroup, AppError> {
     let resource_group = if user.has_scope(Scope::ReadAll) {
         resource_group_source.retrieve(&id, &None).await?
     } else if user.has_scope(Scope::ReadVenObjects) {
@@ -78,18 +88,26 @@ pub async fn get(
         "resource group retrieved"
     );
 
-    Ok(Json(resource_group))
+    Ok(resource_group)
 }
 
-pub async fn add(
-    State(ven_source): State<Arc<dyn VenCrud>>,
-    State(event_source): State<Arc<dyn EventCrud>>,
-    State(privacy): State<Arc<dyn VenObjectPrivacy>>,
+pub async fn get(
     State(resource_group_source): State<Arc<dyn ResourceGroupCrud>>,
-    State(notifier_state): State<Arc<NotifierState>>,
+    Path(id): Path<ResourceGroupId>,
     User(user): User,
-    ValidatedJson(new_resource_group): ValidatedJson<BlResourceGroupRequest>,
-) -> Result<(StatusCode, Json<ResourceGroup>), AppError> {
+) -> AppResponse<ResourceGroup> {
+    Ok(Json(get_core(&*resource_group_source, id, user).await?))
+}
+
+pub(crate) async fn add_core(
+    ven_source: &dyn VenCrud,
+    event_source: &dyn EventCrud,
+    privacy: &dyn VenObjectPrivacy,
+    resource_group_source: &dyn ResourceGroupCrud,
+    notifier_state: &NotifierState,
+    user: Claims,
+    new_resource_group: BlResourceGroupRequest,
+) -> Result<ResourceGroup, AppError> {
     let resource_group = if user.has_scope(Scope::WriteVensBl) {
         resource_group_source
             .create(new_resource_group, &None)
@@ -105,32 +123,55 @@ pub async fn add(
     );
 
     subscription::notify(
-        &*ven_source,
-        &*event_source,
-        &*privacy,
-        &notifier_state,
+        ven_source,
+        event_source,
+        privacy,
+        notifier_state,
         Operation::Create,
         AnyObject::ResourceGroup(resource_group.clone()),
     )
     .await;
+
+    Ok(resource_group)
+}
+
+pub async fn add(
+    State(ven_source): State<Arc<dyn VenCrud>>,
+    State(event_source): State<Arc<dyn EventCrud>>,
+    State(privacy): State<Arc<dyn VenObjectPrivacy>>,
+    State(resource_group_source): State<Arc<dyn ResourceGroupCrud>>,
+    State(notifier_state): State<Arc<NotifierState>>,
+    User(user): User,
+    ValidatedJson(new_resource_group): ValidatedJson<BlResourceGroupRequest>,
+) -> Result<(StatusCode, Json<ResourceGroup>), AppError> {
+    let resource_group = add_core(
+        &*ven_source,
+        &*event_source,
+        &*privacy,
+        &*resource_group_source,
+        &notifier_state,
+        user,
+        new_resource_group,
+    )
+    .await?;
 
     Ok((StatusCode::CREATED, Json(resource_group)))
 }
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "Handler needs access to a lot of the state"
+    reason = "Core fn needs access to a lot of the state"
 )]
-pub async fn edit(
-    State(ven_source): State<Arc<dyn VenCrud>>,
-    State(event_source): State<Arc<dyn EventCrud>>,
-    State(privacy): State<Arc<dyn VenObjectPrivacy>>,
-    State(resource_group_source): State<Arc<dyn ResourceGroupCrud>>,
-    State(notifier_state): State<Arc<NotifierState>>,
-    Path(id): Path<ResourceGroupId>,
-    User(user): User,
-    ValidatedJson(update): ValidatedJson<BlResourceGroupRequest>,
-) -> AppResponse<ResourceGroup> {
+pub(crate) async fn edit_core(
+    ven_source: &dyn VenCrud,
+    event_source: &dyn EventCrud,
+    privacy: &dyn VenObjectPrivacy,
+    resource_group_source: &dyn ResourceGroupCrud,
+    notifier_state: &NotifierState,
+    id: ResourceGroupId,
+    user: Claims,
+    update: BlResourceGroupRequest,
+) -> Result<ResourceGroup, AppError> {
     let new_resource_group = BlResourceGroupRequest {
         resource_group_name: update.resource_group_name,
         targets: update.targets,
@@ -153,16 +194,75 @@ pub async fn edit(
     );
 
     subscription::notify(
-        &*ven_source,
-        &*event_source,
-        &*privacy,
-        &notifier_state,
+        ven_source,
+        event_source,
+        privacy,
+        notifier_state,
         Operation::Update,
         AnyObject::ResourceGroup(resource_group.clone()),
     )
     .await;
 
-    Ok(Json(resource_group))
+    Ok(resource_group)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Handler needs access to a lot of the state"
+)]
+pub async fn edit(
+    State(ven_source): State<Arc<dyn VenCrud>>,
+    State(event_source): State<Arc<dyn EventCrud>>,
+    State(privacy): State<Arc<dyn VenObjectPrivacy>>,
+    State(resource_group_source): State<Arc<dyn ResourceGroupCrud>>,
+    State(notifier_state): State<Arc<NotifierState>>,
+    Path(id): Path<ResourceGroupId>,
+    User(user): User,
+    ValidatedJson(update): ValidatedJson<BlResourceGroupRequest>,
+) -> AppResponse<ResourceGroup> {
+    Ok(Json(
+        edit_core(
+            &*ven_source,
+            &*event_source,
+            &*privacy,
+            &*resource_group_source,
+            &notifier_state,
+            id,
+            user,
+            update,
+        )
+        .await?,
+    ))
+}
+
+pub(crate) async fn delete_core(
+    ven_source: &dyn VenCrud,
+    event_source: &dyn EventCrud,
+    privacy: &dyn VenObjectPrivacy,
+    resource_group_source: &dyn ResourceGroupCrud,
+    notifier_state: &NotifierState,
+    user: Claims,
+    id: ResourceGroupId,
+) -> Result<ResourceGroup, AppError> {
+    let resource_group = if user.has_scope(Scope::WriteVensBl) {
+        resource_group_source.delete(&id, &None).await?
+    } else {
+        return Err(AppError::Forbidden("Missing 'write_vens_bl' scope"));
+    };
+
+    info!(%id, "deleted resource group");
+
+    subscription::notify(
+        ven_source,
+        event_source,
+        privacy,
+        notifier_state,
+        Operation::Delete,
+        AnyObject::ResourceGroup(resource_group.clone()),
+    )
+    .await;
+
+    Ok(resource_group)
 }
 
 pub async fn delete(
@@ -174,25 +274,18 @@ pub async fn delete(
     User(user): User,
     Path(id): Path<ResourceGroupId>,
 ) -> AppResponse<ResourceGroup> {
-    let resource_group = if user.has_scope(Scope::WriteVensBl) {
-        resource_group_source.delete(&id, &None).await?
-    } else {
-        return Err(AppError::Forbidden("Missing 'write_vens_bl' scope"));
-    };
-
-    info!(%id, "deleted resource group");
-
-    subscription::notify(
-        &*ven_source,
-        &*event_source,
-        &*privacy,
-        &notifier_state,
-        Operation::Delete,
-        AnyObject::ResourceGroup(resource_group.clone()),
-    )
-    .await;
-
-    Ok(Json(resource_group))
+    Ok(Json(
+        delete_core(
+            &*ven_source,
+            &*event_source,
+            &*privacy,
+            &*resource_group_source,
+            &notifier_state,
+            user,
+            id,
+        )
+        .await?,
+    ))
 }
 
 #[derive(Deserialize, Validate, Debug)]
