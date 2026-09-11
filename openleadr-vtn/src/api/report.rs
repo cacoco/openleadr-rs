@@ -24,15 +24,14 @@ use crate::{
     },
     data_source::{EventCrud, ReportCrud, VenCrud, VenObjectPrivacy},
     error::AppError,
-    jwt::{Scope, User},
+    jwt::{Claims, Scope, User},
 };
 
-#[instrument(skip(user, report_source))]
-pub async fn get_all(
-    State(report_source): State<Arc<dyn ReportCrud>>,
-    ValidatedQuery(query_params): ValidatedQuery<QueryParams>,
-    User(user): User,
-) -> AppResponse<Vec<Report>> {
+pub(crate) async fn get_all_core(
+    report_source: &dyn ReportCrud,
+    query_params: QueryParams,
+    user: Claims,
+) -> Result<Vec<Report>, AppError> {
     let reports = if user.has_scope(Scope::ReadAll) {
         report_source.retrieve_all(&query_params, &None).await?
     } else if user.has_scope(Scope::ReadVenObjects) {
@@ -47,15 +46,25 @@ pub async fn get_all(
 
     trace!(client_id = user.sub, "retrieved {} reports", reports.len());
 
-    Ok(Json(reports))
+    Ok(reports)
 }
 
 #[instrument(skip(user, report_source))]
-pub async fn get(
+pub async fn get_all(
     State(report_source): State<Arc<dyn ReportCrud>>,
-    Path(id): Path<ReportId>,
+    ValidatedQuery(query_params): ValidatedQuery<QueryParams>,
     User(user): User,
-) -> AppResponse<Report> {
+) -> AppResponse<Vec<Report>> {
+    Ok(Json(
+        get_all_core(&*report_source, query_params, user).await?,
+    ))
+}
+
+pub(crate) async fn get_core(
+    report_source: &dyn ReportCrud,
+    id: ReportId,
+    user: Claims,
+) -> Result<Report, AppError> {
     let report = if user.has_scope(Scope::ReadAll) {
         report_source.retrieve(&id, &None).await?
     } else if user.has_scope(Scope::ReadVenObjects) {
@@ -70,19 +79,27 @@ pub async fn get(
 
     trace!(%report.id, report.report_name=report.content.report_name, client_id = user.sub, "retrieved report");
 
-    Ok(Json(report))
+    Ok(report)
 }
 
-#[instrument(skip(user, ven_source, event_source, privacy, report_source, notifier_state))]
-pub async fn add(
-    State(ven_source): State<Arc<dyn VenCrud>>,
-    State(event_source): State<Arc<dyn EventCrud>>,
-    State(privacy): State<Arc<dyn VenObjectPrivacy>>,
+#[instrument(skip(user, report_source))]
+pub async fn get(
     State(report_source): State<Arc<dyn ReportCrud>>,
-    State(notifier_state): State<Arc<NotifierState>>,
+    Path(id): Path<ReportId>,
     User(user): User,
-    ValidatedJson(new_report): ValidatedJson<ReportRequest>,
-) -> Result<(StatusCode, Json<Report>), AppError> {
+) -> AppResponse<Report> {
+    Ok(Json(get_core(&*report_source, id, user).await?))
+}
+
+pub(crate) async fn add_core(
+    ven_source: &dyn VenCrud,
+    event_source: &dyn EventCrud,
+    privacy: &dyn VenObjectPrivacy,
+    report_source: &dyn ReportCrud,
+    notifier_state: &NotifierState,
+    user: Claims,
+    new_report: ReportRequest,
+) -> Result<Report, AppError> {
     let report = if user.has_scope(Scope::WriteReportsBl) || user.has_scope(Scope::WriteReportsVen)
     {
         report_source
@@ -97,16 +114,81 @@ pub async fn add(
     info!(%report.id, report_name=?report.content.report_name, client_id = user.sub, "report created");
 
     subscription::notify(
-        &*ven_source,
-        &*event_source,
-        &*privacy,
-        &notifier_state,
+        ven_source,
+        event_source,
+        privacy,
+        notifier_state,
         Operation::Create,
         AnyObject::Report(report.clone()),
     )
     .await;
 
+    Ok(report)
+}
+
+#[instrument(skip(user, ven_source, event_source, privacy, report_source, notifier_state))]
+pub async fn add(
+    State(ven_source): State<Arc<dyn VenCrud>>,
+    State(event_source): State<Arc<dyn EventCrud>>,
+    State(privacy): State<Arc<dyn VenObjectPrivacy>>,
+    State(report_source): State<Arc<dyn ReportCrud>>,
+    State(notifier_state): State<Arc<NotifierState>>,
+    User(user): User,
+    ValidatedJson(new_report): ValidatedJson<ReportRequest>,
+) -> Result<(StatusCode, Json<Report>), AppError> {
+    let report = add_core(
+        &*ven_source,
+        &*event_source,
+        &*privacy,
+        &*report_source,
+        &notifier_state,
+        user,
+        new_report,
+    )
+    .await?;
+
     Ok((StatusCode::CREATED, Json(report)))
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Core fn needs access to a lot of the state"
+)]
+pub(crate) async fn edit_core(
+    ven_source: &dyn VenCrud,
+    event_source: &dyn EventCrud,
+    privacy: &dyn VenObjectPrivacy,
+    report_source: &dyn ReportCrud,
+    notifier_state: &NotifierState,
+    id: ReportId,
+    user: Claims,
+    content: ReportRequest,
+) -> Result<Report, AppError> {
+    let report = if user.has_scope(Scope::WriteReportsBl) {
+        report_source.update(&id, content, &None).await?
+    } else if user.has_scope(Scope::WriteReportsVen) {
+        report_source
+            .update(&id, content, &Some(user.client_id()?))
+            .await?
+    } else {
+        return Err(AppError::Forbidden(
+            "Missing 'write_reports_bl' or 'write_reports_ven' scope",
+        ));
+    };
+
+    info!(%report.id, report_name=?report.content.report_name, client_id = user.sub, "report updated");
+
+    subscription::notify(
+        ven_source,
+        event_source,
+        privacy,
+        notifier_state,
+        Operation::Update,
+        AnyObject::Report(report.clone()),
+    )
+    .await;
+
+    Ok(report)
 }
 
 #[expect(
@@ -124,43 +206,30 @@ pub async fn edit(
     User(user): User,
     ValidatedJson(content): ValidatedJson<ReportRequest>,
 ) -> AppResponse<Report> {
-    let report = if user.has_scope(Scope::WriteReportsBl) {
-        report_source.update(&id, content, &None).await?
-    } else if user.has_scope(Scope::WriteReportsVen) {
-        report_source
-            .update(&id, content, &Some(user.client_id()?))
-            .await?
-    } else {
-        return Err(AppError::Forbidden(
-            "Missing 'write_reports_bl' or 'write_reports_ven' scope",
-        ));
-    };
-
-    info!(%report.id, report_name=?report.content.report_name, client_id = user.sub, "report updated");
-
-    subscription::notify(
-        &*ven_source,
-        &*event_source,
-        &*privacy,
-        &notifier_state,
-        Operation::Update,
-        AnyObject::Report(report.clone()),
-    )
-    .await;
-
-    Ok(Json(report))
+    Ok(Json(
+        edit_core(
+            &*ven_source,
+            &*event_source,
+            &*privacy,
+            &*report_source,
+            &notifier_state,
+            id,
+            user,
+            content,
+        )
+        .await?,
+    ))
 }
 
-#[instrument(skip(user, ven_source, event_source, privacy, report_source, notifier_state))]
-pub async fn delete(
-    State(ven_source): State<Arc<dyn VenCrud>>,
-    State(event_source): State<Arc<dyn EventCrud>>,
-    State(privacy): State<Arc<dyn VenObjectPrivacy>>,
-    State(report_source): State<Arc<dyn ReportCrud>>,
-    State(notifier_state): State<Arc<NotifierState>>,
-    User(user): User,
-    Path(id): Path<ReportId>,
-) -> AppResponse<Report> {
+pub(crate) async fn delete_core(
+    ven_source: &dyn VenCrud,
+    event_source: &dyn EventCrud,
+    privacy: &dyn VenObjectPrivacy,
+    report_source: &dyn ReportCrud,
+    notifier_state: &NotifierState,
+    user: Claims,
+    id: ReportId,
+) -> Result<Report, AppError> {
     let report = if user.has_scope(Scope::WriteReportsBl) {
         report_source.delete(&id, &None).await?
     } else if user.has_scope(Scope::WriteReportsVen) {
@@ -174,16 +243,40 @@ pub async fn delete(
     info!(%id, report_name=?report.content.report_name, client_id = user.sub, "deleted report");
 
     subscription::notify(
-        &*ven_source,
-        &*event_source,
-        &*privacy,
-        &notifier_state,
+        ven_source,
+        event_source,
+        privacy,
+        notifier_state,
         Operation::Delete,
         AnyObject::Report(report.clone()),
     )
     .await;
 
-    Ok(Json(report))
+    Ok(report)
+}
+
+#[instrument(skip(user, ven_source, event_source, privacy, report_source, notifier_state))]
+pub async fn delete(
+    State(ven_source): State<Arc<dyn VenCrud>>,
+    State(event_source): State<Arc<dyn EventCrud>>,
+    State(privacy): State<Arc<dyn VenObjectPrivacy>>,
+    State(report_source): State<Arc<dyn ReportCrud>>,
+    State(notifier_state): State<Arc<NotifierState>>,
+    User(user): User,
+    Path(id): Path<ReportId>,
+) -> AppResponse<Report> {
+    Ok(Json(
+        delete_core(
+            &*ven_source,
+            &*event_source,
+            &*privacy,
+            &*report_source,
+            &notifier_state,
+            user,
+            id,
+        )
+        .await?,
+    ))
 }
 
 #[derive(Serialize, Deserialize, Validate, Debug)]
