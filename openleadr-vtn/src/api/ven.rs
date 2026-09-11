@@ -21,14 +21,14 @@ use crate::{
     },
     data_source::{EventCrud, VenCrud, VenObjectPrivacy},
     error::AppError,
-    jwt::{Scope, User},
+    jwt::{Claims, Scope, User},
 };
 
-pub async fn get_all(
-    State(ven_source): State<Arc<dyn VenCrud>>,
-    ValidatedQuery(query_params): ValidatedQuery<QueryParams>,
-    User(user): User,
-) -> AppResponse<Vec<Ven>> {
+pub(crate) async fn get_all_core(
+    ven_source: &dyn VenCrud,
+    query_params: QueryParams,
+    user: Claims,
+) -> Result<Vec<Ven>, AppError> {
     trace!(?query_params);
 
     let vens = if user.has_scope(Scope::ReadAll) {
@@ -45,14 +45,22 @@ pub async fn get_all(
 
     trace!(client_id = user.sub, "retrieved {} VENs", vens.len());
 
-    Ok(Json(vens))
+    Ok(vens)
 }
 
-pub async fn get(
+pub async fn get_all(
     State(ven_source): State<Arc<dyn VenCrud>>,
-    Path(id): Path<VenId>,
+    ValidatedQuery(query_params): ValidatedQuery<QueryParams>,
     User(user): User,
-) -> AppResponse<Ven> {
+) -> AppResponse<Vec<Ven>> {
+    Ok(Json(get_all_core(&*ven_source, query_params, user).await?))
+}
+
+pub(crate) async fn get_core(
+    ven_source: &dyn VenCrud,
+    id: VenId,
+    user: Claims,
+) -> Result<Ven, AppError> {
     let ven = if user.has_scope(Scope::ReadAll) {
         ven_source.retrieve(&id, &None).await?
     } else if user.has_scope(Scope::ReadVenObjects) {
@@ -65,17 +73,25 @@ pub async fn get(
 
     trace!(%ven.id, ven.ven_name=ven.content.ven_name, client_id = user.sub, "VEN retrieved");
 
-    Ok(Json(ven))
+    Ok(ven)
 }
 
-pub async fn add(
-    State(event_source): State<Arc<dyn EventCrud>>,
+pub async fn get(
     State(ven_source): State<Arc<dyn VenCrud>>,
-    State(privacy): State<Arc<dyn VenObjectPrivacy>>,
-    State(notifier_state): State<Arc<NotifierState>>,
+    Path(id): Path<VenId>,
     User(user): User,
-    ValidatedJson(new_ven): ValidatedJson<VenRequest>,
-) -> Result<(StatusCode, Json<Ven>), AppError> {
+) -> AppResponse<Ven> {
+    Ok(Json(get_core(&*ven_source, id, user).await?))
+}
+
+pub(crate) async fn add_core(
+    event_source: &dyn EventCrud,
+    ven_source: &dyn VenCrud,
+    privacy: &dyn VenObjectPrivacy,
+    notifier_state: &NotifierState,
+    user: Claims,
+    new_ven: VenRequest,
+) -> Result<Ven, AppError> {
     let ven = if user.has_scope(Scope::WriteVensBl) {
         let VenRequest::BlVenRequest(new_ven) = new_ven else {
             return Err(AppError::BadRequest(
@@ -108,27 +124,48 @@ pub async fn add(
     info!(%ven.id, ven.ven_name=ven.content.ven_name, client_id = user.sub, "VEN added");
 
     subscription::notify(
-        &*ven_source,
-        &*event_source,
-        &*privacy,
-        &notifier_state,
+        ven_source,
+        event_source,
+        privacy,
+        notifier_state,
         Operation::Create,
         AnyObject::Ven(ven.clone()),
     )
     .await;
 
-    Ok((StatusCode::CREATED, Json(ven)))
+    Ok(ven)
 }
 
-pub async fn edit(
+pub async fn add(
     State(event_source): State<Arc<dyn EventCrud>>,
     State(ven_source): State<Arc<dyn VenCrud>>,
     State(privacy): State<Arc<dyn VenObjectPrivacy>>,
     State(notifier_state): State<Arc<NotifierState>>,
-    Path(id): Path<VenId>,
     User(user): User,
-    ValidatedJson(update): ValidatedJson<VenRequest>,
-) -> AppResponse<Ven> {
+    ValidatedJson(new_ven): ValidatedJson<VenRequest>,
+) -> Result<(StatusCode, Json<Ven>), AppError> {
+    let ven = add_core(
+        &*event_source,
+        &*ven_source,
+        &*privacy,
+        &notifier_state,
+        user,
+        new_ven,
+    )
+    .await?;
+
+    Ok((StatusCode::CREATED, Json(ven)))
+}
+
+pub(crate) async fn edit_core(
+    event_source: &dyn EventCrud,
+    ven_source: &dyn VenCrud,
+    privacy: &dyn VenObjectPrivacy,
+    notifier_state: &NotifierState,
+    id: VenId,
+    user: Claims,
+    update: VenRequest,
+) -> Result<Ven, AppError> {
     let ven = if user.has_scope(Scope::WriteVensBl) {
         let VenRequest::BlVenRequest(update) = update else {
             return Err(AppError::BadRequest(
@@ -163,26 +200,49 @@ pub async fn edit(
     info!(%ven.id, ven.ven_name=ven.content.ven_name, client_id = user.sub, "VEN updated");
 
     subscription::notify(
-        &*ven_source,
-        &*event_source,
-        &*privacy,
-        &notifier_state,
+        ven_source,
+        event_source,
+        privacy,
+        notifier_state,
         Operation::Update,
         AnyObject::Ven(ven.clone()),
     )
     .await;
 
-    Ok(Json(ven))
+    Ok(ven)
 }
 
-pub async fn delete(
+pub async fn edit(
     State(event_source): State<Arc<dyn EventCrud>>,
     State(ven_source): State<Arc<dyn VenCrud>>,
     State(privacy): State<Arc<dyn VenObjectPrivacy>>,
     State(notifier_state): State<Arc<NotifierState>>,
     Path(id): Path<VenId>,
     User(user): User,
+    ValidatedJson(update): ValidatedJson<VenRequest>,
 ) -> AppResponse<Ven> {
+    Ok(Json(
+        edit_core(
+            &*event_source,
+            &*ven_source,
+            &*privacy,
+            &notifier_state,
+            id,
+            user,
+            update,
+        )
+        .await?,
+    ))
+}
+
+pub(crate) async fn delete_core(
+    event_source: &dyn EventCrud,
+    ven_source: &dyn VenCrud,
+    privacy: &dyn VenObjectPrivacy,
+    notifier_state: &NotifierState,
+    id: VenId,
+    user: Claims,
+) -> Result<Ven, AppError> {
     let ven = if user.has_scope(Scope::WriteVensBl) {
         ven_source.delete(&id, &None).await?
     } else if user.has_scope(Scope::WriteVensVen) {
@@ -194,16 +254,37 @@ pub async fn delete(
     info!(%ven.id, ven.ven_name=ven.content.ven_name, client_id = user.sub, "VEN deleted");
 
     subscription::notify(
-        &*ven_source,
-        &*event_source,
-        &*privacy,
-        &notifier_state,
+        ven_source,
+        event_source,
+        privacy,
+        notifier_state,
         Operation::Delete,
         AnyObject::Ven(ven.clone()),
     )
     .await;
 
-    Ok(Json(ven))
+    Ok(ven)
+}
+
+pub async fn delete(
+    State(event_source): State<Arc<dyn EventCrud>>,
+    State(ven_source): State<Arc<dyn VenCrud>>,
+    State(privacy): State<Arc<dyn VenObjectPrivacy>>,
+    State(notifier_state): State<Arc<NotifierState>>,
+    Path(id): Path<VenId>,
+    User(user): User,
+) -> AppResponse<Ven> {
+    Ok(Json(
+        delete_core(
+            &*event_source,
+            &*ven_source,
+            &*privacy,
+            &notifier_state,
+            id,
+            user,
+        )
+        .await?,
+    ))
 }
 
 #[derive(Deserialize, Validate, Debug)]
