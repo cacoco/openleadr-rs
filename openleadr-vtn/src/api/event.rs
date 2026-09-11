@@ -23,14 +23,14 @@ use crate::{
     },
     data_source::{EventCrud, VenCrud, VenObjectPrivacy},
     error::AppError,
-    jwt::{Scope, User},
+    jwt::{Claims, Scope, User},
 };
 
-pub async fn get_all(
-    State(event_source): State<Arc<dyn EventCrud>>,
-    ValidatedQuery(query_params): ValidatedQuery<QueryParams>,
-    User(user): User,
-) -> AppResponse<Vec<Event>> {
+pub(crate) async fn get_all_core(
+    event_source: &dyn EventCrud,
+    query_params: QueryParams,
+    user: Claims,
+) -> Result<Vec<Event>, AppError> {
     trace!(?query_params);
     let events = if user.has_scope(Scope::ReadAll) {
         event_source.retrieve_all(&query_params, &None).await?
@@ -45,14 +45,24 @@ pub async fn get_all(
     };
     trace!(client_id = user.sub, "retrieved {} events", events.len());
 
-    Ok(Json(events))
+    Ok(events)
 }
 
-pub async fn get(
+pub async fn get_all(
     State(event_source): State<Arc<dyn EventCrud>>,
-    Path(id): Path<EventId>,
+    ValidatedQuery(query_params): ValidatedQuery<QueryParams>,
     User(user): User,
-) -> AppResponse<Event> {
+) -> AppResponse<Vec<Event>> {
+    Ok(Json(
+        get_all_core(&*event_source, query_params, user).await?,
+    ))
+}
+
+pub(crate) async fn get_core(
+    event_source: &dyn EventCrud,
+    id: EventId,
+    user: Claims,
+) -> Result<Event, AppError> {
     let event = if user.has_scope(Scope::ReadAll) {
         event_source.retrieve(&id, &None).await?
     } else if user.has_scope(Scope::ReadTargets) {
@@ -65,17 +75,25 @@ pub async fn get(
 
     trace!(%event.id, event.event_name=event.content.event_name, client_id = user.sub, "retrieved event");
 
-    Ok(Json(event))
+    Ok(event)
 }
 
-pub async fn add(
-    State(ven_source): State<Arc<dyn VenCrud>>,
+pub async fn get(
     State(event_source): State<Arc<dyn EventCrud>>,
-    State(privacy): State<Arc<dyn VenObjectPrivacy>>,
-    State(notifier_state): State<Arc<NotifierState>>,
+    Path(id): Path<EventId>,
     User(user): User,
-    ValidatedJson(new_event): ValidatedJson<EventRequest>,
-) -> Result<(StatusCode, Json<Event>), AppError> {
+) -> AppResponse<Event> {
+    Ok(Json(get_core(&*event_source, id, user).await?))
+}
+
+pub(crate) async fn add_core(
+    ven_source: &dyn VenCrud,
+    event_source: &dyn EventCrud,
+    privacy: &dyn VenObjectPrivacy,
+    notifier_state: &NotifierState,
+    user: Claims,
+    new_event: EventRequest,
+) -> Result<Event, AppError> {
     if !user.has_scope(Scope::WriteEvents) {
         return Err(AppError::Forbidden("Missing 'write_events' scope"));
     }
@@ -87,27 +105,48 @@ pub async fn add(
     info!(%event.id, event_name=event.content.event_name, client_id = user.sub, "event created");
 
     subscription::notify(
-        &*ven_source,
-        &*event_source,
-        &*privacy,
-        &notifier_state,
+        ven_source,
+        event_source,
+        privacy,
+        notifier_state,
         Operation::Create,
         AnyObject::Event(event.clone()),
     )
     .await;
 
-    Ok((StatusCode::CREATED, Json(event)))
+    Ok(event)
 }
 
-pub async fn edit(
+pub async fn add(
     State(ven_source): State<Arc<dyn VenCrud>>,
     State(event_source): State<Arc<dyn EventCrud>>,
     State(privacy): State<Arc<dyn VenObjectPrivacy>>,
     State(notifier_state): State<Arc<NotifierState>>,
-    Path(id): Path<EventId>,
     User(user): User,
-    ValidatedJson(content): ValidatedJson<EventRequest>,
-) -> AppResponse<Event> {
+    ValidatedJson(new_event): ValidatedJson<EventRequest>,
+) -> Result<(StatusCode, Json<Event>), AppError> {
+    let event = add_core(
+        &*ven_source,
+        &*event_source,
+        &*privacy,
+        &notifier_state,
+        user,
+        new_event,
+    )
+    .await?;
+
+    Ok((StatusCode::CREATED, Json(event)))
+}
+
+pub(crate) async fn edit_core(
+    ven_source: &dyn VenCrud,
+    event_source: &dyn EventCrud,
+    privacy: &dyn VenObjectPrivacy,
+    notifier_state: &NotifierState,
+    id: EventId,
+    user: Claims,
+    content: EventRequest,
+) -> Result<Event, AppError> {
     if !user.has_scope(Scope::WriteEvents) {
         return Err(AppError::Forbidden("Missing 'write_events' scope"));
     }
@@ -119,16 +158,67 @@ pub async fn edit(
     info!(%event.id, event_name=event.content.event_name, client_id = user.sub, "event updated");
 
     subscription::notify(
-        &*ven_source,
-        &*event_source,
-        &*privacy,
-        &notifier_state,
+        ven_source,
+        event_source,
+        privacy,
+        notifier_state,
         Operation::Update,
         AnyObject::Event(event.clone()),
     )
     .await;
 
-    Ok(Json(event))
+    Ok(event)
+}
+
+pub async fn edit(
+    State(ven_source): State<Arc<dyn VenCrud>>,
+    State(event_source): State<Arc<dyn EventCrud>>,
+    State(privacy): State<Arc<dyn VenObjectPrivacy>>,
+    State(notifier_state): State<Arc<NotifierState>>,
+    Path(id): Path<EventId>,
+    User(user): User,
+    ValidatedJson(content): ValidatedJson<EventRequest>,
+) -> AppResponse<Event> {
+    Ok(Json(
+        edit_core(
+            &*ven_source,
+            &*event_source,
+            &*privacy,
+            &notifier_state,
+            id,
+            user,
+            content,
+        )
+        .await?,
+    ))
+}
+
+pub(crate) async fn delete_core(
+    ven_source: &dyn VenCrud,
+    event_source: &dyn EventCrud,
+    privacy: &dyn VenObjectPrivacy,
+    notifier_state: &NotifierState,
+    id: EventId,
+    user: Claims,
+) -> Result<Event, AppError> {
+    if !user.has_scope(Scope::WriteEvents) {
+        return Err(AppError::Forbidden("Missing 'write_events' scope"));
+    }
+
+    let event = event_source.delete(&id, &Some(user.client_id()?)).await?;
+    info!(%event.id, event.event_name=event.content.event_name, client_id = user.sub, "deleted event");
+
+    subscription::notify(
+        ven_source,
+        event_source,
+        privacy,
+        notifier_state,
+        Operation::Delete,
+        AnyObject::Event(event.clone()),
+    )
+    .await;
+
+    Ok(event)
 }
 
 pub async fn delete(
@@ -139,24 +229,17 @@ pub async fn delete(
     Path(id): Path<EventId>,
     User(user): User,
 ) -> AppResponse<Event> {
-    if !user.has_scope(Scope::WriteEvents) {
-        return Err(AppError::Forbidden("Missing 'write_events' scope"));
-    }
-
-    let event = event_source.delete(&id, &Some(user.client_id()?)).await?;
-    info!(%event.id, event.event_name=event.content.event_name, client_id = user.sub, "deleted event");
-
-    subscription::notify(
-        &*ven_source,
-        &*event_source,
-        &*privacy,
-        &notifier_state,
-        Operation::Delete,
-        AnyObject::Event(event.clone()),
-    )
-    .await;
-
-    Ok(Json(event))
+    Ok(Json(
+        delete_core(
+            &*ven_source,
+            &*event_source,
+            &*privacy,
+            &notifier_state,
+            id,
+            user,
+        )
+        .await?,
+    ))
 }
 
 #[derive(Deserialize, Validate, Debug)]
