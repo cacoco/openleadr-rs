@@ -115,11 +115,11 @@ impl NotifierState {
     }
 }
 
-pub async fn get_all(
-    State(subscription_source): State<Arc<dyn SubscriptionCrud>>,
-    ValidatedQuery(query_params): ValidatedQuery<QueryParams>,
-    User(user): User,
-) -> AppResponse<Vec<Subscription>> {
+pub(crate) async fn get_all_core(
+    subscription_source: &dyn SubscriptionCrud,
+    query_params: QueryParams,
+    user: Claims,
+) -> Result<Vec<Subscription>, AppError> {
     trace!(?query_params);
 
     // FIXME update retrieve_all implementation when removing this
@@ -153,14 +153,24 @@ pub async fn get_all(
         resources.len()
     );
 
-    Ok(Json(resources))
+    Ok(resources)
 }
 
-pub async fn get(
+pub async fn get_all(
     State(subscription_source): State<Arc<dyn SubscriptionCrud>>,
-    Path(id): Path<SubscriptionId>,
+    ValidatedQuery(query_params): ValidatedQuery<QueryParams>,
     User(user): User,
-) -> AppResponse<Subscription> {
+) -> AppResponse<Vec<Subscription>> {
+    Ok(Json(
+        get_all_core(&*subscription_source, query_params, user).await?,
+    ))
+}
+
+pub(crate) async fn get_core(
+    subscription_source: &dyn SubscriptionCrud,
+    id: SubscriptionId,
+    user: Claims,
+) -> Result<Subscription, AppError> {
     let subscription = if user.has_scope(Scope::ReadAll) {
         subscription_source.retrieve(&id, &None).await?
     } else if user.has_scope(Scope::ReadVenObjects) {
@@ -180,15 +190,23 @@ pub async fn get(
         "subscription retrieved"
     );
 
-    Ok(Json(subscription))
+    Ok(subscription)
 }
 
-pub async fn add(
+pub async fn get(
     State(subscription_source): State<Arc<dyn SubscriptionCrud>>,
-    State(app_state): State<AppState>,
+    Path(id): Path<SubscriptionId>,
     User(user): User,
-    ValidatedJson(new_subscription): ValidatedJson<SubscriptionRequest>,
-) -> Result<(StatusCode, Json<Subscription>), AppError> {
+) -> AppResponse<Subscription> {
+    Ok(Json(get_core(&*subscription_source, id, user).await?))
+}
+
+pub(crate) async fn add_core(
+    subscription_source: &dyn SubscriptionCrud,
+    notifier: &NotifierState,
+    user: Claims,
+    new_subscription: SubscriptionRequest,
+) -> Result<Subscription, AppError> {
     let client_id = user.client_id()?;
 
     let subscription = if user.has_scope(Scope::WriteSubscriptionsVen)
@@ -201,8 +219,7 @@ pub async fn add(
         return Err(AppError::Forbidden("Missing 'write_vens' scope"));
     };
 
-    app_state
-        .notifier
+    notifier
         .subscriptions
         .lock()
         .await
@@ -215,16 +232,33 @@ pub async fn add(
         "resource added"
     );
 
+    Ok(subscription)
+}
+
+pub async fn add(
+    State(subscription_source): State<Arc<dyn SubscriptionCrud>>,
+    State(app_state): State<AppState>,
+    User(user): User,
+    ValidatedJson(new_subscription): ValidatedJson<SubscriptionRequest>,
+) -> Result<(StatusCode, Json<Subscription>), AppError> {
+    let subscription = add_core(
+        &*subscription_source,
+        &app_state.notifier,
+        user,
+        new_subscription,
+    )
+    .await?;
+
     Ok((StatusCode::CREATED, Json(subscription)))
 }
 
-pub async fn edit(
-    State(subscription_source): State<Arc<dyn SubscriptionCrud>>,
-    State(app_state): State<AppState>,
-    Path(id): Path<SubscriptionId>,
-    User(user): User,
-    ValidatedJson(update): ValidatedJson<SubscriptionRequest>,
-) -> AppResponse<Subscription> {
+pub(crate) async fn edit_core(
+    subscription_source: &dyn SubscriptionCrud,
+    notifier: &NotifierState,
+    id: SubscriptionId,
+    user: Claims,
+    update: SubscriptionRequest,
+) -> Result<Subscription, AppError> {
     let subscription = if user.has_scope(Scope::WriteSubscriptionsBl) {
         subscription_source.update(&id, update, &None).await?
     } else if user.has_scope(Scope::WriteSubscriptionsVen) {
@@ -235,8 +269,7 @@ pub async fn edit(
         return Err(AppError::Forbidden("Missing 'write_subscriptions' scope"));
     };
 
-    app_state
-        .notifier
+    notifier
         .subscriptions
         .lock()
         .await
@@ -249,15 +282,27 @@ pub async fn edit(
         "resource updated"
     );
 
-    Ok(Json(subscription))
+    Ok(subscription)
 }
 
-pub async fn delete(
+pub async fn edit(
     State(subscription_source): State<Arc<dyn SubscriptionCrud>>,
     State(app_state): State<AppState>,
     Path(id): Path<SubscriptionId>,
     User(user): User,
+    ValidatedJson(update): ValidatedJson<SubscriptionRequest>,
 ) -> AppResponse<Subscription> {
+    Ok(Json(
+        edit_core(&*subscription_source, &app_state.notifier, id, user, update).await?,
+    ))
+}
+
+pub(crate) async fn delete_core(
+    subscription_source: &dyn SubscriptionCrud,
+    notifier: &NotifierState,
+    id: SubscriptionId,
+    user: Claims,
+) -> Result<Subscription, AppError> {
     let subscription = if user.has_scope(Scope::WriteSubscriptionsBl) {
         subscription_source.delete(&id, &None).await?
     } else if user.has_scope(Scope::WriteSubscriptionsVen) {
@@ -268,16 +313,22 @@ pub async fn delete(
         return Err(AppError::Forbidden("Missing 'write_subscriptions' scope"));
     };
 
-    app_state
-        .notifier
-        .subscriptions
-        .lock()
-        .await
-        .remove(&subscription.id);
+    notifier.subscriptions.lock().await.remove(&subscription.id);
 
     info!(%id, client_id = user.sub, "deleted subscription");
 
-    Ok(Json(subscription))
+    Ok(subscription)
+}
+
+pub async fn delete(
+    State(subscription_source): State<Arc<dyn SubscriptionCrud>>,
+    State(app_state): State<AppState>,
+    Path(id): Path<SubscriptionId>,
+    User(user): User,
+) -> AppResponse<Subscription> {
+    Ok(Json(
+        delete_core(&*subscription_source, &app_state.notifier, id, user).await?,
+    ))
 }
 
 #[derive(Deserialize, Validate, Debug)]
